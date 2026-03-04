@@ -81,6 +81,61 @@ def _get_uri_from_resource(res: Any) -> str | None:
     return getattr(res, "uri", None) or getattr(res, "url", None)
 
 
+def _extract_image_urls_from_text(text: str) -> list[str]:
+    """Extract image URLs from message text: http(s) URLs and data: URLs."""
+    urls: list[str] = []
+    # data: URL (single match per message is enough)
+    data_match = re.search(r"data:image/[^;]+;base64,[^\s]+", text)
+    if data_match:
+        urls.append(data_match.group(0))
+    # http(s) URLs - match URL until whitespace or end
+    for m in re.finditer(r"https?://[^\s<>'\"]+", text):
+        urls.append(m.group(0).rstrip(".,;:)"))
+    return urls
+
+
+def _image_bytes_from_data_url_or_inline(ctx: Context, item: dict) -> bytes | None:
+    """
+    Get image bytes from a content dict that may contain:
+    - url/uri: data: URL (base64) or http(s) URL
+    - image_url: { "url": "..." } (OpenAI-style)
+    - data or contents: raw base64 string
+    """
+    url = item.get("url") or item.get("uri")
+    if not url and isinstance(item.get("image_url"), dict):
+        url = item.get("image_url", {}).get("url")
+    if url and isinstance(url, str):
+        url = url.strip()
+        if url.startswith("data:"):
+            # data:image/jpeg;base64,<payload>
+            try:
+                header, b64 = url.split(",", 1)
+                if "base64" in header:
+                    raw = base64.b64decode(b64)
+                    if len(raw) >= 100:
+                        return raw
+            except Exception as e:
+                ctx.logger.warning(f"Failed to decode data URL: {e}")
+        else:
+            try:
+                response = httpx.get(url, timeout=60)
+                response.raise_for_status()
+                raw = response.content
+                if len(raw) >= 100:
+                    return raw
+            except Exception as e:
+                ctx.logger.warning(f"Failed to fetch image URL: {e}")
+    b64_str = item.get("data") or item.get("contents")
+    if isinstance(b64_str, str):
+        try:
+            raw = base64.b64decode(b64_str)
+            if len(raw) >= 100:
+                return raw
+        except Exception as e:
+            ctx.logger.warning(f"Failed to decode inline base64: {e}")
+    return None
+
+
 def _download_image_bytes(
     ctx: Context,
     resource_id: str,
@@ -470,7 +525,9 @@ def _build_poll_text(receipt: Receipt) -> str:
 def _next_step_message(state: str, has_items: bool) -> str:
     """Return context-aware next-step hint instead of generic 'send a photo'."""
     if not has_items:
-        return "Send a receipt photo or type **help** for commands."
+        return (
+            "No receipt items yet. You can: (1) **Send a receipt photo** (I’ll extract items from it) or add items manually: **add &lt;name&gt; &lt;price&gt;** (e.g. `add Coffee 3.50`). Type **help** for all commands."
+        )
     if state == "draft":
         return (
             "Next: say **done** to start the poll, or add more items with **add &lt;name&gt; &lt;price&gt;**.\n"
@@ -534,7 +591,8 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         if top_level_name:
             display_name_from_metadata = top_level_name
 
-    for item in msg.content:
+    content_list = getattr(msg, "content", None) or []
+    for item in content_list:
         if isinstance(item, MetadataContent):
             meta = item.metadata or {}
             content_level_name = _display_name_from_metadata(meta)
@@ -563,11 +621,12 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             # Content may arrive as raw dict from some clients (e.g. ASI-One),
             # sometimes without a strict `type` field of "resource" or "image".
             # Be flexible and treat any dict that looks like it has a resource
-            # identifier or URI as an attachment.
+            # identifier, URI, or inline image data.
+            has_image_keys = any(
+                key in item for key in ("resource_id", "resourceId", "resource", "uri", "url", "image_url", "data", "contents")
+            )
             suspected_type = (item.get("type") or "").lower()
-            if suspected_type in ("resource", "image", "attachment", "file") or any(
-                key in item for key in ("resource_id", "resourceId", "resource", "uri", "url")
-            ):
+            if suspected_type in ("resource", "image", "attachment", "file") or has_image_keys:
                 saw_attachment = True
                 rid = item.get("resource_id") or item.get("resourceId")
                 res = item.get("resource")
@@ -582,15 +641,43 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                         data = _download_image_bytes(ctx, "", resources_list) if resources_list else None
                     if data:
                         image_bytes = data
-                else:
-                    ctx.logger.warning("Resource dict missing resource_id and resource/uri")
+                if not image_bytes:
+                    # Try top-level uri/url (no resource_id), or inline base64 / data URL
+                    direct_url = item.get("uri") or item.get("url")
+                    if direct_url and not isinstance(direct_url, dict):
+                        resources_list = [{"uri": direct_url, "url": direct_url}]
+                        data = _download_image_bytes(ctx, "", resources_list)
+                        if data:
+                            image_bytes = data
+                    if not image_bytes:
+                        data = _image_bytes_from_data_url_or_inline(ctx, item)
+                        if data:
+                            image_bytes = data
+                if not image_bytes and (rid or res or has_image_keys):
+                    ctx.logger.warning(
+                        "Could not get image from dict (missing resource_id/uri or download failed). Keys: %s",
+                        list(item.keys()),
+                    )
         else:
-            ctx.logger.debug(f"Content item type: {type(item).__name__}")
+            # Log unknown content so we can extend support (e.g. other clients)
+            if isinstance(item, dict):
+                ctx.logger.debug("Content item (dict) keys: %s", list(item.keys()))
+            else:
+                ctx.logger.debug("Content item type: %s", type(item).__name__)
 
     # Prepare cleaned text once so image+text in same message can reuse parsing.
     raw_text = user_text.strip()
     raw_text = re.sub(r"@\w+", "", raw_text).strip()
     text = raw_text.lower()
+
+    # Fallback: platform may not send image as ResourceContent; try image URLs in message text.
+    if not image_bytes and raw_text:
+        for url in _extract_image_urls_from_text(raw_text):
+            data = _image_bytes_from_data_url_or_inline(ctx, {"url": url, "uri": url})
+            if data:
+                image_bytes = data
+                ctx.logger.info("Using image from URL in message text")
+                break
 
     # Use display name from profile/metadata automatically (no need to type "I'm X")
     # Don't overwrite if user explicitly set name with "I'm X"
