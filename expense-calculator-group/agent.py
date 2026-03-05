@@ -2,10 +2,13 @@
 Receipt / Expense Calculator agent for ASI-One and Agentverse.
 - Accepts receipt photo: extracts line items via OpenAI Vision.
 - Or add items manually. Then poll (who brought what) and show fair split.
+- Optional Stripe payment after listing items (same flow as stripe-horoscope-agent).
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -24,9 +27,25 @@ from uagents_core.contrib.protocols.chat import (
     TextContent,
     chat_protocol_spec,
 )
+# Payment protocol exists only in uagents-core >= 0.4.0
+try:
+    from uagents_core.contrib.protocols.payment import (
+        CommitPayment,
+        CompletePayment,
+        Funds,
+        RejectPayment,
+        RequestPayment,
+    )
+    _PAYMENT_PROTOCOL_AVAILABLE = True
+except ModuleNotFoundError:
+    CommitPayment = CompletePayment = Funds = RejectPayment = RequestPayment = None  # type: ignore
+    _PAYMENT_PROTOCOL_AVAILABLE = False
+
 from uagents_core.storage import ExternalStorage
 from dotenv import load_dotenv
 
+load_dotenv()  # Load .env before config so STRIPE_* keys are available
+from config import STRIPE_AMOUNT_CENTS, STRIPE_ENABLED
 from expense_logic import (
     Receipt,
     ReceiptItem,
@@ -38,7 +57,25 @@ from expense_logic import (
 )
 from receipt_vision import extract_items_from_receipt_image
 
-load_dotenv()
+if _PAYMENT_PROTOCOL_AVAILABLE:
+    from stripe_payments import create_embedded_checkout_session, verify_checkout_session_paid
+    from payment_proto import build_payment_proto
+else:
+    create_embedded_checkout_session = verify_checkout_session_paid = build_payment_proto = None  # type: ignore
+
+# #region debug log
+_debug_log_path = "/Users/rutujanemane/Documents/fetchai/cohort 2/.cursor/debug.log"
+def _debug_log(msg: str, data: dict | None = None, hypothesis_id: str = ""):
+    payload = {"message": msg, "timestamp": __import__("datetime").datetime.now(timezone.utc).isoformat(), "hypothesisId": hypothesis_id}
+    if data is not None:
+        payload["data"] = {k: (v if not isinstance(v, bytes) else f"<bytes len={len(v)}>") for k, v in data.items()}
+    try:
+        os.makedirs(os.path.dirname(_debug_log_path), exist_ok=True)
+        with open(_debug_log_path, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 # Storage keys
 RECEIPT_STATE = "expense_receipt_state"
@@ -50,8 +87,35 @@ RECEIPT_PARTICIPANTS = "expense_receipt_participants"  # senders seen in current
 RECEIPT_EXPECTED_COUNT = "expense_receipt_expected_count"  # optional total participants in group
 RECEIPT_PAYER_SENDER = "expense_receipt_payer_sender"
 RECEIPT_PAYER_NAME = "expense_receipt_payer_name"
+# Per-sender Stripe payment state (awaiting_payment, pending_stripe checkout dict)
+PAYMENT_STATE_PREFIX = "expense_payment_state:"
 
 STORAGE_URL = os.getenv("AGENTVERSE_URL", "https://agentverse.ai") + "/v1/storage"
+
+
+def _payment_state_key(sender: str) -> str:
+    return f"{PAYMENT_STATE_PREFIX}{sender}"
+
+
+def _load_payment_state(ctx: Context, sender: str) -> dict:
+    raw = ctx.storage.get(_payment_state_key(sender))
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_payment_state(ctx: Context, sender: str, data: dict) -> None:
+    ctx.storage.set(_payment_state_key(sender), json.dumps(data))
+
+
+def _clear_payment_state(ctx: Context, sender: str) -> None:
+    ctx.storage.set(_payment_state_key(sender), "{}")
 
 agent = Agent(
     name="ReceiptCalculator",
@@ -578,6 +642,37 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         ),
     )
 
+    # If Stripe payment is pending for this sender, re-send RequestPayment unless user wants to cancel/skip/start over.
+    if _PAYMENT_PROTOCOL_AVAILABLE and STRIPE_ENABLED:
+        payment_state = _load_payment_state(ctx, sender)
+        pending_stripe = payment_state.get("pending_stripe") if isinstance(payment_state.get("pending_stripe"), dict) else None
+        if pending_stripe:
+            # Get user text early to allow "cancel" / "new receipt" / "skip" to clear pending and unstick the flow.
+            early_text = ""
+            for c in getattr(msg, "content", None) or []:
+                if isinstance(c, TextContent):
+                    early_text = (c.text or "").strip().lower()
+                    break
+            cancel_phrases = ("new receipt", "cancel", "skip payment", "skip", "start over", "help", "no payment", "without payment")
+            if any(p in early_text for p in cancel_phrases):
+                _clear_payment_state(ctx, sender)
+                # Fall through so "new receipt" / "help" / "cancel" are handled below (e.g. new receipt → "✅ New receipt started...")
+            else:
+                req = RequestPayment(
+                    accepted_funds=[Funds(currency="USD", amount=f"{STRIPE_AMOUNT_CENTS / 100:.2f}", payment_method="stripe")],
+                    recipient=str(ctx.agent.address),
+                    deadline_seconds=300,
+                    reference=str(ctx.session),
+                    description="Pay to unlock receipt split (expense calculator).",
+                    metadata={"stripe": pending_stripe, "service": "expense_calculator"},
+                )
+                await ctx.send(sender, req)
+                await ctx.send(
+                    sender,
+                    text_msg("Payment is still pending. Please complete the Stripe checkout above. Once paid, you can say **done** to start the poll."),
+                )
+                return
+
     # Collect content: session start, text, image resource, and metadata (for display name)
     user_text = ""
     image_bytes: bytes | None = None
@@ -592,6 +687,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             display_name_from_metadata = top_level_name
 
     content_list = getattr(msg, "content", None) or []
+    session_start_pending = False  # Defer so RequestPayment can be first when we have receipt+payment
     for item in content_list:
         if isinstance(item, MetadataContent):
             meta = item.metadata or {}
@@ -599,16 +695,8 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             if content_level_name:
                 display_name_from_metadata = content_level_name
         elif isinstance(item, StartSessionContent):
-            await ctx.send(
-                sender,
-                ChatMessage(
-                    timestamp=datetime.now(timezone.utc),
-                    msg_id=uuid4(),
-                    content=[MetadataContent(type="metadata", metadata={"attachments": "true"})],
-                ),
-            )
-            await ctx.send(sender, text_msg(WELCOME))
-            # Continue to process image if present in same message
+            session_start_pending = True
+            # Don't send here when message may also contain an image: we send RequestPayment first, then receipt, then this
         elif isinstance(item, TextContent):
             user_text = (item.text or "").strip()
         elif isinstance(item, ResourceContent):
@@ -689,6 +777,30 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             ctx.storage.set(RECEIPT_NAMES, names)
             ctx.logger.info(f"Display name from profile for {sender[:12]}…: {display_name_from_metadata[:20]}")
 
+    async def _send_session_start_if_pending() -> None:
+        nonlocal session_start_pending
+        _debug_log(
+            "session_start_if_pending_called",
+            {"session_start_pending_before": session_start_pending},
+            "H6_ORDER",
+        )
+        if not session_start_pending:
+            return
+        session_start_pending = False
+        await ctx.send(
+            sender,
+            ChatMessage(
+                timestamp=datetime.now(timezone.utc),
+                msg_id=uuid4(),
+                content=[MetadataContent(type="metadata", metadata={"attachments": "true"})],
+            ),
+        )
+        await ctx.send(sender, text_msg(WELCOME))
+
+    # If no image in this message, send deferred session start now (so user gets WELCOME).
+    if session_start_pending and not image_bytes:
+        await _send_session_start_if_pending()
+
     # --- Process receipt photo if present ---
     if image_bytes:
         try:
@@ -746,11 +858,13 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
 
             # If user said done/start poll in same first message, skip to polling immediately
             start_poll_now = _intent_is_start_poll(text)
+            _debug_log("receipt from image", {"items_found": len(items_found), "start_poll_now": start_poll_now, "skips_payment_block": start_poll_now}, "H3")
             if start_poll_now:
                 _save_receipt(ctx, "polling", receipt, {})
                 status_line = ", ".join(received_parts)
                 poll_intro = f"📷 **Read your receipt.**\n\n✅ Received: {status_line}\n\n"
                 await ctx.send(sender, text_msg(poll_intro + _build_poll_text(receipt)))
+                await _send_session_start_if_pending()
                 return
 
             # Single message with item list so the list always shows (no separate "Reading..." message)
@@ -772,16 +886,88 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             lines.append("")
             lines.append("**Next:**")
             if not payer_set:
-                lines.append("- If known, set payer: `Rutuja paid this bill` (or `I paid this bill`)")
+                lines.append(
+                    "- **Who paid this bill?** Tell me who paid so I can settle correctly "
+                    "(for example: `Rutuja paid this bill` or `I paid`)."
+                )
             if not group_set:
                 lines.append("- Optional: set group size for pending accuracy: `group size 3`")
             lines.append("- Say **done** to start the poll, or add/edit items if needed")
-            await ctx.send(sender, text_msg("\n".join(lines)))
+            # Match stripe-horoscope-agent: send RequestPayment *first* so the client shows embedded Stripe UI, then the receipt list.
+            _debug_log(
+                "after receipt list: payment check",
+                {
+                    "payment_protocol_available": _PAYMENT_PROTOCOL_AVAILABLE,
+                    "stripe_enabled": STRIPE_ENABLED,
+                    "will_request_payment": _PAYMENT_PROTOCOL_AVAILABLE and STRIPE_ENABLED,
+                    "items_count": len(receipt.items),
+                },
+                "H1_H2_H4",
+            )
+            if _PAYMENT_PROTOCOL_AVAILABLE and STRIPE_ENABLED:
+                description = f"Receipt processing — {len(receipt.items)} items, total ${receipt.total():.2f}"
+                checkout = await asyncio.to_thread(
+                    create_embedded_checkout_session,
+                    user_address=sender,
+                    chat_session_id=str(ctx.session),
+                    description=description,
+                )
+                # Log that we built a Stripe Checkout session, but only record non-sensitive metadata.
+                _debug_log(
+                    "built_stripe_checkout_session",
+                    {
+                        "checkout_keys": sorted(list(checkout.keys())),
+                        "has_client_secret": bool(checkout.get("client_secret")),
+                        "has_publishable_key": bool(checkout.get("publishable_key")),
+                        "amount_cents": checkout.get("amount_cents"),
+                        "currency": checkout.get("currency"),
+                        "ui_mode": checkout.get("ui_mode"),
+                    },
+                    "H5_FORMAT",
+                )
+                _save_payment_state(ctx, sender, {"pending_stripe": checkout})
+                req = RequestPayment(
+                    accepted_funds=[Funds(currency="USD", amount=f"{STRIPE_AMOUNT_CENTS / 100:.2f}", payment_method="stripe")],
+                    recipient=str(ctx.agent.address),
+                    deadline_seconds=300,
+                    reference=str(ctx.session),
+                    description="Pay to unlock receipt split (expense calculator).",
+                    metadata={"stripe": checkout, "service": "expense_calculator"},
+                )
+                # Log sanitized RequestPayment details right before sending so we can compare to working agents.
+                try:
+                    accepted_funds_snapshot = [
+                        {
+                            "currency": f.currency,
+                            "amount": f.amount,
+                            "payment_method": f.payment_method,
+                        }
+                        for f in req.accepted_funds
+                    ]
+                except Exception:
+                    accepted_funds_snapshot = []
+                stripe_meta = req.metadata.get("stripe") if isinstance(req.metadata, dict) else None
+                _debug_log(
+                    "about_to_send_RequestPayment",
+                    {
+                        "accepted_funds": accepted_funds_snapshot,
+                        "metadata_keys": sorted(list(req.metadata.keys())) if isinstance(req.metadata, dict) else [],
+                        "stripe_meta_keys": sorted(list(stripe_meta.keys())) if isinstance(stripe_meta, dict) else [],
+                        "service": req.metadata.get("service") if isinstance(req.metadata, dict) else None,
+                    },
+                    "H5_FORMAT",
+                )
+                await ctx.send(sender, req)
+                await ctx.send(sender, text_msg("\n".join(lines) + "\n\nPlease complete payment above. Once paid, you can say **done** to start the poll."))
+            else:
+                await ctx.send(sender, text_msg("\n".join(lines)))
+            await _send_session_start_if_pending()
         else:
             await ctx.send(
                 sender,
                 text_msg("I couldn’t find any line items in that image. Try a clearer photo or add items manually: **add &lt;name&gt; &lt;price&gt;**."),
             )
+            await _send_session_start_if_pending()
         return
 
     # --- Text-only handling ---
@@ -1181,11 +1367,22 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                 ),
             )
             return
+        payer_sender_id = ctx.storage.get(RECEIPT_PAYER_SENDER)
+        payer_display_name = ctx.storage.get(RECEIPT_PAYER_NAME)
+        if not payer_display_name:
+            await ctx.send(
+                sender,
+                text_msg(
+                    "I don’t know **who paid this bill** yet. Before we calculate the final split, "
+                    "please tell me who paid (for example: `Rutuja paid this bill` or `I paid`).\n"
+                    "Then run **calculate summary** or **calculate detailed** again."
+                ),
+            )
+            return
+
         resolved: dict[str, str] = {}
         for sid in selections.keys():
             resolved[sid] = names.get(sid)
-        payer_sender_id = ctx.storage.get(RECEIPT_PAYER_SENDER)
-        payer_display_name = ctx.storage.get(RECEIPT_PAYER_NAME)
         participants_for_calc = list(selections.keys())
         if calc_mode == "summary":
             result = format_split_summary_table(
@@ -1262,8 +1459,35 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     ctx.logger.info(f"ACK from {sender}")
 
 
-agent.include(chat_proto, publish_manifest=True)
+if _PAYMENT_PROTOCOL_AVAILABLE:
 
+    async def on_commit(ctx: Context, sender: str, msg: CommitPayment):
+        if msg.funds.payment_method != "stripe" or not msg.transaction_id:
+            await ctx.send(sender, RejectPayment(reason="Unsupported payment method (expected stripe)."))
+            return
+
+        paid = await asyncio.to_thread(verify_checkout_session_paid, msg.transaction_id)
+        if not paid:
+            await ctx.send(sender, RejectPayment(reason="Stripe payment not completed yet. Please finish checkout."))
+            return
+
+        _clear_payment_state(ctx, sender)
+        await ctx.send(sender, CompletePayment(transaction_id=msg.transaction_id))
+        await ctx.send(
+            sender,
+            text_msg("Payment received. Say **done** to start the poll, or add/edit items if needed."),
+        )
+
+    async def on_reject(ctx: Context, sender: str, msg: RejectPayment):
+        _clear_payment_state(ctx, sender)
+        await ctx.send(sender, text_msg(f"Payment was rejected. {msg.reason or ''}".strip()))
+
+
+agent.include(chat_proto, publish_manifest=True)
+if _PAYMENT_PROTOCOL_AVAILABLE:
+    agent.include(build_payment_proto(on_commit, on_reject), publish_manifest=True)
+
+_debug_log("agent loaded", {"payment_protocol_available": _PAYMENT_PROTOCOL_AVAILABLE, "stripe_enabled": STRIPE_ENABLED}, "H1_H2")
 
 if __name__ == "__main__":
     print("🧾 Receipt / Expense Calculator")
