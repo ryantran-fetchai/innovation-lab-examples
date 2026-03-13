@@ -1,6 +1,6 @@
 # Real Estate Search Agent
 
-A uAgents-based real estate search assistant that accepts natural-language queries, fetches live listings using [HomeHarvest](https://github.com/Bunsly/HomeHarvest) (Zillow, Realtor.com, Redfin), and delivers results as a formatted Google Sheet — with optional Stripe payment gating.
+A uAgents-based real estate search assistant powered by the **Claude SDK** that accepts natural-language queries, fetches live listings using [HomeHarvest](https://github.com/Bunsly/HomeHarvest) (Zillow, Realtor.com, Redfin), and delivers results as a formatted Google Sheet — with optional Stripe payment gating.
 
 Deployable to [Agentverse](https://agentverse.ai) and compatible with **ASI:One** chat.
 
@@ -39,7 +39,7 @@ User query
 ## Prerequisites
 
 - Python 3.11+
-- [Anthropic API key](https://console.anthropic.com/) — for query parsing and the agent loop
+- [Claude SDK API key](https://console.anthropic.com/) — for query parsing and the agent loop
 - [Agentverse API key](https://agentverse.ai/) — for mailbox deployment
 - Google OAuth client JSON — Desktop/Web app credentials from [Google Cloud Console](https://console.cloud.google.com/)
 - Stripe account (optional) — for payment-gated sheet delivery
@@ -91,7 +91,7 @@ docker compose up --build
 | Variable | Description |
 |---|---|
 | `AGENT_SEED` | Private seed phrase for agent identity (keep secret) |
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude |
+| `ANTHROPIC_API_KEY` | Claude SDK API key |
 | `AGENTVERSE_API_KEY` | Agentverse API key for mailbox auth |
 | `GOOGLE_OAUTH_CLIENT_JSON` | Google OAuth client JSON (inline, as one line) |
 
@@ -161,9 +161,9 @@ Without Stripe configured, the sheet is delivered for free immediately after sea
 | No listings returned | Broaden location/price filters or increase `past_days` |
 | Zillow 403 errors | HomeHarvest falls back to Realtor.com and Redfin automatically |
 
-## Claude API Usage
+## Claude SDK Usage
 
-This agent uses the [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) directly.
+This agent uses the **[Claude SDK](https://github.com/anthropics/anthropic-sdk-python)** (`anthropic` Python package) directly.
 
 ```python
 import anthropic
