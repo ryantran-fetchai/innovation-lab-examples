@@ -235,7 +235,7 @@ async def _execute_tool(tool_name: str, tool_input: dict, state: _RunState) -> s
                     "location": search.location,
                 })
 
-            preview = df.head(5).to_dict(orient="records")
+            preview = json.loads(df.head(5).to_json(orient="records"))
             return json.dumps({
                 "status": "success",
                 "num_results": len(df),
