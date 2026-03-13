@@ -507,7 +507,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     """Handle messages from ASI:One and other chat-protocol clients."""
     await ctx.send(sender, ChatAcknowledgement(acknowledged_msg_id=msg.msg_id))
 
-    query = msg.text().strip()
+    query = next((item.text for item in msg.content if isinstance(item, TextContent)), "").strip()
     if not query:
         await ctx.send(
             sender,

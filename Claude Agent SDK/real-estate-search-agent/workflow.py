@@ -241,9 +241,9 @@ async def _execute_tool(tool_name: str, tool_input: dict, state: _RunState) -> s
                 "num_results": len(df),
                 "location": search.location,
                 "listing_type": search.listing_type,
-                "price_min": int(df["Price ($)"].min()) if "Price ($)" in df.columns else None,
-                "price_max": int(df["Price ($)"].max()) if "Price ($)" in df.columns else None,
-                "price_avg": int(df["Price ($)"].mean()) if "Price ($)" in df.columns else None,
+                "price_min": (lambda v: None if v != v else int(v))(df["Price ($)"].min()) if "Price ($)" in df.columns else None,
+                "price_max": (lambda v: None if v != v else int(v))(df["Price ($)"].max()) if "Price ($)" in df.columns else None,
+                "price_avg": (lambda v: None if v != v else int(v))(df["Price ($)"].mean()) if "Price ($)" in df.columns else None,
                 "sample_listings": preview,
             })
 
