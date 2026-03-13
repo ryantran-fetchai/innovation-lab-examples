@@ -305,17 +305,17 @@ def create_listings_sheet(
 
     num_rows = len(rows) + 1
     price_col_idx = headers.index("Price ($)") + 1 if "Price ($)" in headers else None
-    if price_col_idx:
-        price_col_letter = chr(64 + price_col_idx)
-        worksheet.format(
-            f"{price_col_letter}2:{price_col_letter}{num_rows}",
-            {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0"}},
-        )
-
     worksheet.columns_auto_resize(0, len(headers))
 
     summary = f"Found {len(df)} properties in {location} | Generated {timestamp}"
     worksheet.insert_row([summary], index=1)
+
+    if price_col_idx:
+        price_col_letter = chr(64 + price_col_idx)
+        worksheet.format(
+            f"{price_col_letter}3:{price_col_letter}{num_rows + 1}",
+            {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0"}},
+        )
     worksheet.format(
         "A1",
         {
